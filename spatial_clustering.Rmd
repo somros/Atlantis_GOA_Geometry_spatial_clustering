@@ -1,0 +1,274 @@
+---
+title: "Spatial clustering of physical variables for GOA Atlantis geometry"
+author: "Alberto Rovellini"
+date: "10/20/2020"
+output: 
+  html_document:
+    fig_width: 10
+    fig_height: 14
+    code_folding: hide
+    
+---
+
+This document manipulates netCDF files of satellite-derived physical variables for the GOA. Variables are SST, chlorophyll-a, PAR, and KD490 (turbidity). I picked these because they are the variables Mariska Weijerman used for the same purpose for the Hawaaii Atlantis model geometry. This document then performs spatial clustering with "complete linkages" based on Euclidea distances, which is the protocol used for the Hawaii model. 
+
+The purpose of this exercise is to inform and validate the definition of Atlantis spatial polygons. Clustering is performed at different *k* dimensions (*k* = 2, 3, ..., 10), and the most "conserved" clusters are considered areas that have similar physical properties, based on the data used.
+
+For this analysis I use staellite data from MODIS-Aqua (https://oceancolor.gsfc.nasa.gov/data/aqua/#:~:text=MODIS%20(or%20Moderate%20Resolution%20Imaging,the%20equator%20in%20the%20afternoon.), freely available from NASA. Satellite-derived ocean color data are from OBDAAC (https://oceancolor.gsfc.nasa.gov/). I use Level 3 data (https://oceancolor.gsfc.nasa.gov/products/), which means they are aggregated and projected. To get the data:
+
+From L3 Browser (https://oceancolor.gsfc.nasa.gov/l3/), using the “Extract” function I place orders for monthly, mapped, 4km data for [-175:-120][45:65] between 2002-10-01 and 2015-10-01 for:
+
+- Chlorophyll-a
+- KD490
+- PAR
+- SST 4mu nighttime
+
+I repeat the process for 9 km, seasonal data. This lower resolution may help with computation time because it will produce a smaller matrix, also for the resolution that Atlantis can achieve it will be fine. Can keep 4 km monthly data for smaller areas and for details.
+
+Note that this code as of now is not particularly optimized, and may not be viable on computers with limited memory due to the allocation of large items.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(ncdf4)
+library(raster)
+library(tidync)
+library(dplyr)
+library(ggmap)
+library(ggplot2)
+library(reshape2)
+library(maps)
+library(RColorBrewer) 
+
+```
+
+First thing, define the spatial extent of the clustring exercise. Computational limitations force me to break it up - but also the spatial clustering should be done at small-to-medium scales. 
+
+```{r}
+
+limits.lon <- c(-135, -130) 
+limits.lat <- c(52.5, 57.5)
+
+```
+
+# 1. Read and prepare satellite data
+
+Read in all netCDF files. Here you need to specify if you want to do 4 km monthly or 9 km seasonal.
+
+```{r}
+
+directories <- dir("C:/Users/arove/Documents/GOA/GOA_geometry/Data/physical_variables_clustering/modis_data_L3_mapped_GOA/9km_seasonal/", no.. = T, full.names = T)
+
+ncvar.list <- vector(mode = "list", length = length(directories)) # create empty list, one slot for each variable / directory
+
+for(i in 1:length(ncvar.list)) {
+  nc.paths <- list.files(directories[i], full.names = T) # find paths for each directory
+  nc.list <- vector(mode = "list", length = length(nc.paths)) # make list of nc files for each variable
+  for (j in 1:length(nc.list)) {
+    nc.list[[j]] <- nc_open(nc.paths[[j]]) # open all netCDF files
+  }
+  ncvar.list[[i]] <- nc.list # list of all variables is made of 4 lists of 157 nc files each
+}
+
+```
+
+Check that lat and lon are the same for all netCDF files we are reading.
+
+```{r}
+
+for (i in 1:length(ncvar.list)) { # run the loop below once for each variable
+  
+  nc.list <- ncvar.list[[i]]
+  
+  lon.list <- vector(mode = "list", length = length(nc.list)) # prepare two empty lists, one for lon and one for lat
+  lat.list <- vector(mode = "list", length = length(nc.list)) 
+  
+  for(j in 1:length(nc.list)) {
+    
+    lon.list[[j]] <- ncvar_get(nc.list[[j]], varid = "lon") # extract lon and lat from each nc file
+    lat.list[[j]] <- ncvar_get(nc.list[[j]], varid = "lat") 
+  }
+  
+  if(!all(sapply(lon.list, FUN = identical, lon.list[[1]])) || # this is a check to make sure that all lats and all longs are okay
+     !all(sapply(lat.list, FUN = identical, lat.list[[1]])))  # using first element of the list because it is transitive - they ALL need to be identical
+    
+  {
+    stop("The longitude and latitude values of the netCDF files you are reading are not all the same, and that may cause spatial mismatch of physical variables between years.")
+  } else {
+    message("Longitude and latitude are the same for all netCDF files within the same directory (e.g. of the same variable): OK to proceed.")
+  }
+}
+
+```
+
+If the previous chunk ran with no Errors, the coordinates are uniforma for all the netCDF files. Now extract the variables from each of them.
+
+```{r}
+
+# define the variables from the netCDF files
+
+var.names <- c("chlor_a", "Kd_490", "par", "sst4") # you need to modify these with the names of your variables as they are defined in your netCDF files (ncdf4::print(nc))
+
+ncvar.frames.list <- vector(mode = "list", length = length(ncvar.list)) # this makes a very large list (~3 Gb). Is there any other way?
+
+for (i in 1:length(ncvar.list)) {
+  
+  nc.list <- ncvar.list[[i]]
+  
+  var.list <- vector(mode = "list", length = length(nc.list)) # empty list for the variable
+  names.list <- vector(mode = "list", length = length(nc.list)) # empty list for column names of the csv
+  
+  for(j in 1: length(nc.list)) {
+    var.list[[j]] <- as.vector(ncvar_get(nc.list[[j]], varid = var.names[i])) 
+    
+    timestart <- gsub(pattern = '-', replacement = '_', x = ncatt_get(nc.list[[j]], 0, attname = "time_coverage_start")$value)
+    
+    names.list[[j]] <-  paste( # set names for each element of the variable list, which is defined by the corresponding netCDF attributes: which variable are we measuring, and what year/month does it refer to?
+      var.names[i],
+      substr(timestart, 1, 10),
+      sep = '_'
+    )
+    
+  }
+  
+  var.frame <- data.frame(matrix(unlist(var.list), ncol = length(var.list), byrow = F))
+  
+  lon <-  ncvar_get(nc.list[[1]], varid = "lon")
+  lat <- ncvar_get(nc.list[[1]], varid = "lat")
+  lonlat <- as.matrix(expand.grid(lon, lat))
+  
+  var.frame <- data.frame(lonlat, var.frame)
+  
+  colnames(var.frame) <- c("Lon", "Lat", unlist(names.list))
+  
+  var.frame <- subset(var.frame, Lon > limits.lon[1] & Lon < limits.lon[2] & Lat > limits.lat[1] & Lat < limits.lat[2])
+  
+  ncvar.frames.list[[i]] <- var.frame
+  
+}
+
+physical.variables <- cbind(ncvar.frames.list[[1]],
+                            ncvar.frames.list[[2]][,-c(1,2)],
+                            ncvar.frames.list[[3]][,-c(1,2)],
+                            ncvar.frames.list[[4]][,-c(1,2)])
+
+```
+
+Now we have a matrix where rows are unique points in our grid, and columns are values of each variable. 
+
+# 2. Spatial clustering
+
+```{r}
+
+phys.no.na <- physical.variables[rowSums(is.na(physical.variables[,-c(1,2)])) != ncol(physical.variables[,-c(1,2)]),] # remove rows that are all NAs, as those rows represent points that have never been sampled (and they break hclust())
+
+topomap <- phys.no.na[,c(1,2)] # get lon lat data frame, to be used for plotting
+
+var.mat <-as.matrix(phys.no.na[,-c(1,2)]) # turn to matrix
+
+# because variables are on different scales (e.g. SST vs Chl-a vs PAR), we need to normalize
+
+var.mat <- scale(var.mat)
+
+## following command is the bottleneck, in terms of computation time
+
+my.dist <- dist(var.mat) # Euclidean distance
+
+my.clusts <- hclust(my.dist) # this uses complete linkages as done by Mariska
+
+# set vector of k-groups to cut the cluster
+
+k <- c(2:12)#, 15, 20, 25, 30)#, 35, 40, 45, 50) # for consistency with Mariska's code
+
+# loop over the k values
+
+for (i in 1:length(k)) {
+  
+  memb <- cutree(my.clusts, k = k[i])
+  
+  topomap <- data.frame(topomap, factor(k[i] - memb))
+  
+}
+
+colnames(topomap) <- c("Lon", "Lat", paste("k", k, sep = '_'))
+
+# prepare data frame for plot
+
+topomap.long <- melt(topomap, id.vars = list("Lon", "Lat"), variable.name = "Kdim", value.name = "Clusters")
+
+# reorder levels
+
+topomap.long$Clusters <- factor(topomap.long$Clusters, levels = unique(as.factor(0:k[length(k)]-1)))
+
+```
+
+There is a clear computational bottleneck with the dist() function. 9 km seasonal data works (in ~3 minutes) for an area 5 x 5 degrees. Cannot go too much smaller given the size of the model. That grid is 14375 cells, or unique lonlat points.
+
+Be aware that normalizing the input matrix for dist(), which makes conceptual sense to me, does yield substantially different results compared to not doing it.
+
+## Plot map.
+
+```{r, fig.width = 10, fig.height = 14}
+
+# get some map data to draw coastline
+
+map.data <- map_data("world") %>% dplyr::filter(
+  long > limits.lon[1] & long < limits.lon[2] & lat > limits.lat[1] & lat < limits.lat[2]
+)
+
+# prepare longer palette
+
+colourCount <- length(0:(k[length(k)]-1))
+getPalette <- colorRampPalette(brewer.pal(9, "Set1"))
+
+# make plot
+
+clustermap <- ggplot()+
+  geom_tile(data = topomap.long, aes(x = Lon, y = Lat, fill = Clusters))+
+  scale_fill_manual(values = getPalette(colourCount))+
+  geom_polygon(data = map.data, aes(x = long, y = lat, group = group), fill = "white")+
+  coord_equal()+
+  theme_bw()+
+  facet_wrap(~ Kdim, ncol = 3)
+
+clustermap # unclear why it will not change the colors?
+
+mapname <- paste("Clustering",
+                 paste(levels(factor(substr(colnames(var.mat), 1, 3))), collapse = ''),
+                 paste(as.character(limits.lat), collapse = ''),
+                 paste(as.character(limits.lon), collapse = ''),
+                 collapse = '', sep = '_')
+
+ggsave(paste0("C:/Users/arove/Documents/GOA/GOA_geometry/Data/physical_variables_clustering/Images/",
+              mapname,
+              ".png"), clustermap, height = 14, width = 10)
+
+```
+
+Below is diagnostic section (qualitative) for visual inspection of raw plots from the rasters (nc files) and of the processed matrix "physical.variables", wihch is used as input of dist after droppig empty lines.
+
+```{r, eval = FALSE}
+
+test.nc <- raster("C:/Users/arove/Documents/GOA/GOA_geometry/Data/physical_variables_clustering/modis_data_L3_mapped_GOA/9km_seasonal/sst4/AQUA_MODIS.20020621_20020920.L3m.SNSU.SST4.x_sst4.nc", varname = "sst4")
+
+test.points <- data.frame(rasterToPoints(test.nc))
+
+test.points <- subset(test.points, x > limits.lon[1] & x < limits.lon[2] & y > limits.lat[1] & y < limits.lat[2])
+
+plot.nc <- ggplot(data = test.points, aes(x = x, y = y, color = X4um.Sea.Surface.Temperature, fill =  X4um.Sea.Surface.Temperature))+
+  geom_tile()
+plot.nc
+
+```
+
+```{r, eval = FALSE}
+test.mat <- physical.variables[,c(1,2,168)]
+
+plot.mat <- ggplot(data = test.mat, aes(x = Lon, y = Lat, color = sst4_2002_07_04, fill = sst4_2002_07_04))+
+  geom_tile()
+plot.mat
+
+```
